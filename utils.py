@@ -2,7 +2,6 @@ import os
 import docx
 import pdfplumber
 import pytesseract
-from pdf2image import convert_from_path
 from PIL import Image
 import torch
 
@@ -20,7 +19,7 @@ for p in TESSERACT_PATHS:
         pytesseract.pytesseract.tesseract_cmd = p
         break
 
-# Global cached models (Lazy Loaded to save RAM)
+# Global cached models (Lazy Loaded)
 _trocr_processor = None
 _trocr_model = None
 _summarizer_tokenizer = None
@@ -52,7 +51,9 @@ def extract_from_txt(file_path):
     for enc in encodings:
         try:
             with open(file_path, 'r', encoding=enc) as f:
-                return f.read().strip()
+                content = f.read().strip()
+                if content:
+                    return content
         except UnicodeDecodeError:
             continue
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -75,60 +76,90 @@ def extract_from_pdf(file_path):
     return "\n\n".join(text_content)
 
 def extract_from_scanned_pdf(file_path):
-    """Convert PDF pages to images (using pdf2image) and run pytesseract OCR on each page."""
+    """Convert PDF pages to images via pypdfium2 (no Poppler binary required) and run OCR."""
+    images = []
+    # Try pypdfium2 first (pure Python wheel, no Poppler needed!)
     try:
-        images = convert_from_path(file_path)
-    except Exception as e:
-        raise RuntimeError(f"Error converting PDF pages to images. Ensure Poppler is installed: {e}")
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(file_path)
+        for page in pdf:
+            image = page.render(scale=2).to_pil()
+            images.append(image)
+    except Exception:
+        # Fallback to pdf2image
+        try:
+            from pdf2image import convert_from_path
+            images = convert_from_path(file_path)
+        except Exception as e:
+            raise RuntimeError(f"Could not convert PDF to images: {e}")
 
     extracted_pages = []
     for idx, img in enumerate(images):
+        page_text = ""
+        # Try pytesseract OCR
         try:
-            page_text = pytesseract.image_to_string(img)
-            if page_text.strip():
-                extracted_pages.append(page_text.strip())
-        except Exception as e:
-            raise RuntimeError(f"Tesseract OCR failed on page {idx+1}. Ensure Tesseract binary is installed: {e}")
+            page_text = pytesseract.image_to_string(img).strip()
+        except Exception:
+            page_text = ""
+
+        # Fallback to TrOCR if pytesseract failed or returned empty
+        if not page_text:
+            try:
+                processor, model = get_trocr_model()
+                with torch.no_grad():
+                    pv = processor(images=img.convert("RGB"), return_tensors="pt").pixel_values
+                    g_ids = model.generate(pv)
+                    page_text = processor.batch_decode(g_ids, skip_special_tokens=True)[0].strip()
+            except Exception:
+                pass
+
+        if page_text:
+            extracted_pages.append(page_text)
 
     return "\n\n".join(extracted_pages)
 
 def extract_from_handwritten_image(image_path):
     """Use Hugging Face's microsoft/trocr-base-handwritten model to read handwritten text from an uploaded image."""
-    processor, model = get_trocr_model()
     image = Image.open(image_path).convert("RGB")
-
     width, height = image.size
 
-    with torch.no_grad():
-        pixel_values = processor(images=image, return_tensors="pt").pixel_values
-        generated_ids = model.generate(pixel_values)
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    generated_text = ""
+    # Try TrOCR model
+    try:
+        processor, model = get_trocr_model()
+        with torch.no_grad():
+            pixel_values = processor(images=image, return_tensors="pt").pixel_values
+            generated_ids = model.generate(pixel_values)
+            generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    except Exception as e:
+        print(f"TrOCR extraction notice: {e}")
 
     # If TrOCR single-pass text is very short and the image is tall, crop into horizontal line strips
     if len(generated_text.strip()) < 10 and height > 80:
-        line_height = min(60, height // 3)
-        lines = []
-        for top in range(0, height, line_height):
-            bottom = min(top + line_height + 10, height)
-            line_crop = image.crop((0, top, width, bottom))
-            try:
+        try:
+            processor, model = get_trocr_model()
+            line_height = min(60, height // 3)
+            lines = []
+            for top in range(0, height, line_height):
+                bottom = min(top + line_height + 10, height)
+                line_crop = image.crop((0, top, width, bottom))
                 with torch.no_grad():
                     pv = processor(images=line_crop, return_tensors="pt").pixel_values
                     g_ids = model.generate(pv)
                     txt = processor.batch_decode(g_ids, skip_special_tokens=True)[0]
                     if txt.strip() and txt.strip() not in lines:
                         lines.append(txt.strip())
-            except Exception:
-                pass
-        if lines:
-            generated_text = "\n".join(lines)
+            if lines:
+                generated_text = "\n".join(lines)
+        except Exception:
+            pass
 
-    # Fallback to pytesseract if text remains very short
+    # Fallback to pytesseract if available and generated_text is still short
     if len(generated_text.strip()) < 10:
         try:
-            tess_text = pytesseract.image_to_string(image)
-            if len(tess_text.strip()) > len(generated_text.strip()):
-                generated_text = tess_text.strip()
+            tess_text = pytesseract.image_to_string(image).strip()
+            if len(tess_text) > len(generated_text.strip()):
+                generated_text = tess_text
         except Exception:
             pass
 
@@ -136,12 +167,7 @@ def extract_from_handwritten_image(image_path):
 
 def is_low_quality_text(text):
     """Check if extracted OCR text is low quality, near-empty, or garbage."""
-    if not text or len(text.strip()) < 15:
-        return True
-    
-    alphanumeric_count = sum(1 for c in text if c.isalnum())
-    ratio = alphanumeric_count / len(text)
-    if ratio < 0.3:
+    if not text or len(text.strip()) < 10:
         return True
     return False
 
@@ -170,31 +196,31 @@ def detect_and_extract(file_path):
             try:
                 extracted_text = extract_from_scanned_pdf(file_path)
             except Exception as e:
-                warning_msg = f"Scanned PDF extraction warning: {str(e)}"
+                warning_msg = f"Scanned PDF extraction notice: {str(e)}"
                 if not extracted_text:
-                    extracted_text = f"Error extracting from scanned PDF: {e}"
+                    extracted_text = f"Error extracting from PDF: {e}"
 
     elif ext in [".jpg", ".jpeg", ".png"]:
         try:
             extracted_text = extract_from_handwritten_image(file_path)
         except Exception as e:
-            warning_msg = f"Handwritten OCR extraction error: {str(e)}"
+            warning_msg = f"Image extraction notice: {str(e)}"
             try:
                 img = Image.open(file_path)
                 extracted_text = pytesseract.image_to_string(img).strip()
             except Exception as tess_err:
-                extracted_text = f"Failed to extract text from image: {e} | Tesseract fallback error: {tess_err}"
+                extracted_text = f"Could not extract readable text from image. Details: {e}"
 
     else:
         raise ValueError(f"Unsupported file format: {ext}. Supported formats: .txt, .docx, .pdf, .jpg, .jpeg, .png")
 
     if is_low_quality_text(extracted_text) and not warning_msg:
-        warning_msg = "Warning: The extracted text is very short or contains low confidence OCR results. The input image or document quality may be too low."
+        warning_msg = "Warning: The extracted text is very short or empty. Please ensure the document or image contains readable text."
 
     return extracted_text, warning_msg
 
-def fallback_extractive_summarize(text, num_sentences=2):
-    """Fallback extractive summarizer based on word frequency ranking."""
+def fallback_extractive_summarize(text, num_sentences=3):
+    """Fallback extractive summarizer based on sentence scoring."""
     import re
     sentences = [s.strip() for s in re.split(r'(?<=[.!?]) +', text) if s.strip()]
     if len(sentences) <= num_sentences:
@@ -216,8 +242,8 @@ def fallback_extractive_summarize(text, num_sentences=2):
     return " ".join(top_sentences_in_order)
 
 def summarize_extracted_text(text, max_length=150, min_length=30):
-    """Generate summary from extracted text using HuggingFace model with extractive fallback."""
-    if not text or len(text.strip()) < 20:
+    """Generate summary from extracted text with guaranteed fallback."""
+    if not text or len(text.strip()) < 15:
         return "Cannot summarize: Provided text is too short or empty."
 
     try:
@@ -236,7 +262,10 @@ def summarize_extracted_text(text, max_length=150, min_length=30):
                 num_beams=2,
                 early_stopping=True
             )
-        return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        if summary.strip():
+            return summary.strip()
     except Exception as e:
         print(f"Neural summarizer warning: {e}. Using extractive fallback.")
-        return fallback_extractive_summarize(text)
+
+    return fallback_extractive_summarize(text)

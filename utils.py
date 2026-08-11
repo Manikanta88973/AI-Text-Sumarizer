@@ -5,12 +5,9 @@ import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
 import torch
-from transformers import (
-    TrOCRProcessor,
-    VisionEncoderDecoderModel,
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM
-)
+
+# Limit CPU threads to prevent memory spikes on constrained containers
+torch.set_num_threads(1)
 
 # Setup tesseract path if on Windows in default location
 TESSERACT_PATHS = [
@@ -23,7 +20,7 @@ for p in TESSERACT_PATHS:
         pytesseract.pytesseract.tesseract_cmd = p
         break
 
-# Global cached models to prevent reload overhead
+# Global cached models (Lazy Loaded to save RAM)
 _trocr_processor = None
 _trocr_model = None
 _summarizer_tokenizer = None
@@ -32,17 +29,21 @@ _summarizer_model = None
 def get_trocr_model():
     global _trocr_processor, _trocr_model
     if _trocr_processor is None or _trocr_model is None:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
         model_name = "microsoft/trocr-base-handwritten"
         _trocr_processor = TrOCRProcessor.from_pretrained(model_name)
-        _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name)
+        _trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name, low_cpu_mem_usage=True)
+        _trocr_model.eval()
     return _trocr_processor, _trocr_model
 
 def get_summarizer():
     global _summarizer_tokenizer, _summarizer_model
     if _summarizer_tokenizer is None or _summarizer_model is None:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         model_name = "sshleifer/distilbart-cnn-12-6"
         _summarizer_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        _summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        _summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, low_cpu_mem_usage=True)
+        _summarizer_model.eval()
     return _summarizer_tokenizer, _summarizer_model
 
 def extract_from_txt(file_path):
@@ -98,10 +99,10 @@ def extract_from_handwritten_image(image_path):
 
     width, height = image.size
 
-    # Single pass TrOCR inference
-    pixel_values = processor(images=image, return_tensors="pt").pixel_values
-    generated_ids = model.generate(pixel_values)
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    with torch.no_grad():
+        pixel_values = processor(images=image, return_tensors="pt").pixel_values
+        generated_ids = model.generate(pixel_values)
+        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
     # If TrOCR single-pass text is very short and the image is tall, crop into horizontal line strips
     if len(generated_text.strip()) < 10 and height > 80:
@@ -111,11 +112,12 @@ def extract_from_handwritten_image(image_path):
             bottom = min(top + line_height + 10, height)
             line_crop = image.crop((0, top, width, bottom))
             try:
-                pv = processor(images=line_crop, return_tensors="pt").pixel_values
-                g_ids = model.generate(pv)
-                txt = processor.batch_decode(g_ids, skip_special_tokens=True)[0]
-                if txt.strip() and txt.strip() not in lines:
-                    lines.append(txt.strip())
+                with torch.no_grad():
+                    pv = processor(images=line_crop, return_tensors="pt").pixel_values
+                    g_ids = model.generate(pv)
+                    txt = processor.batch_decode(g_ids, skip_special_tokens=True)[0]
+                    if txt.strip() and txt.strip() not in lines:
+                        lines.append(txt.strip())
             except Exception:
                 pass
         if lines:
@@ -164,7 +166,6 @@ def detect_and_extract(file_path):
         except Exception:
             extracted_text = ""
 
-        # If empty or near-empty text (< 15 chars), fallback to scanned PDF extraction (OCR)
         if not extracted_text or len(extracted_text.strip()) < 15:
             try:
                 extracted_text = extract_from_scanned_pdf(file_path)
@@ -187,7 +188,6 @@ def detect_and_extract(file_path):
     else:
         raise ValueError(f"Unsupported file format: {ext}. Supported formats: .txt, .docx, .pdf, .jpg, .jpeg, .png")
 
-    # Graceful low quality check
     if is_low_quality_text(extracted_text) and not warning_msg:
         warning_msg = "Warning: The extracted text is very short or contains low confidence OCR results. The input image or document quality may be too low."
 
@@ -228,13 +228,14 @@ def summarize_extracted_text(text, max_length=150, min_length=30):
         effective_max = min(max_length, max(min_length + 10, input_len))
         effective_min = min(min_length, max(5, effective_max - 10))
 
-        summary_ids = model.generate(
-            inputs["input_ids"],
-            max_length=effective_max,
-            min_length=effective_min,
-            num_beams=4,
-            early_stopping=True
-        )
+        with torch.no_grad():
+            summary_ids = model.generate(
+                inputs["input_ids"],
+                max_length=effective_max,
+                min_length=effective_min,
+                num_beams=2,
+                early_stopping=True
+            )
         return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
     except Exception as e:
         print(f"Neural summarizer warning: {e}. Using extractive fallback.")

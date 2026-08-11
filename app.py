@@ -148,4 +148,6 @@ with gr.Blocks(title="Multi-Format AI Text Summarizer") as app:
     )
 
 if __name__ == "__main__":
-    app.launch(server_name="127.0.0.1", server_port=7860, share=False, theme=gr.themes.Soft())
+    server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
+    server_port = int(os.environ.get("PORT", os.environ.get("GRADIO_SERVER_PORT", 7860)))
+    app.launch(server_name=server_name, server_port=server_port, theme=gr.themes.Soft())

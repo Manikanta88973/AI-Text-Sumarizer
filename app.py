@@ -11,7 +11,6 @@ def process_file_or_text(file_obj, raw_text_input, max_len, min_len, progress=gr
         file_path = file_obj.name if hasattr(file_obj, 'name') else str(file_obj)
         ext = os.path.splitext(file_path)[1].lower()
 
-        # Update progress with specific loading indicator step
         if ext in [".jpg", ".jpeg", ".png"]:
             progress(0.2, desc="Running TrOCR Handwritten Neural Model...")
         elif ext == ".pdf":
@@ -40,7 +39,6 @@ def process_file_or_text(file_obj, raw_text_input, max_len, min_len, progress=gr
             ""
         )
 
-    # Validate extracted text before summarizing
     if not extracted_text or len(extracted_text.strip()) < 10:
         return (
             extracted_text,
@@ -83,7 +81,7 @@ def extract_only(file_obj, raw_text_input, progress=gr.Progress()):
         return "", "⚠️ **No Input**: Please upload a file or enter text."
 
 # Build Gradio UI
-with gr.Blocks(title="Multi-Format AI Text Summarizer") as app:
+with gr.Blocks(title="Multi-Format AI Text Summarizer") as demo:
     gr.Markdown(
         """
         # 📝 Multi-Format AI Text Summarizer
@@ -147,7 +145,12 @@ with gr.Blocks(title="Multi-Format AI Text Summarizer") as app:
         outputs=[raw_text_output, warning_box, summary_output]
     )
 
+# Top-level ASGI exports for Vercel / Serverless function compatibility
+app = demo.app
+application = demo.app
+handler = demo.app
+
 if __name__ == "__main__":
     server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
     server_port = int(os.environ.get("PORT", os.environ.get("GRADIO_SERVER_PORT", 7860)))
-    app.launch(server_name=server_name, server_port=server_port, theme=gr.themes.Soft())
+    demo.launch(server_name=server_name, server_port=server_port, theme=gr.themes.Soft())

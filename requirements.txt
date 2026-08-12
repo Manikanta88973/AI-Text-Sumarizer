@@ -1,6 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 gradio>=4.0.0
 python-docx>=1.1.0
 pdfplumber>=0.10.0
+pypdfium2>=4.0.0
 pytesseract>=0.3.10
 pdf2image>=1.17.0
 Pillow>=10.0.0

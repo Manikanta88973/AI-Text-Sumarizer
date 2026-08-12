@@ -1,5 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-gradio>=4.0.0
+streamlit>=1.30.0
 python-docx>=1.1.0
 pdfplumber>=0.10.0
 pypdfium2>=4.0.0

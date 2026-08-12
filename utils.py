@@ -19,12 +19,21 @@ for p in TESSERACT_PATHS:
         pytesseract.pytesseract.tesseract_cmd = p
         break
 
+# Optional Streamlit caching decorator for model resources
+try:
+    import streamlit as st
+    cache_resource = st.cache_resource
+except ImportError:
+    def cache_resource(fn):
+        return fn
+
 # Global cached models (Lazy Loaded)
 _trocr_processor = None
 _trocr_model = None
 _summarizer_tokenizer = None
 _summarizer_model = None
 
+@cache_resource
 def get_trocr_model():
     global _trocr_processor, _trocr_model
     if _trocr_processor is None or _trocr_model is None:
@@ -35,6 +44,7 @@ def get_trocr_model():
         _trocr_model.eval()
     return _trocr_processor, _trocr_model
 
+@cache_resource
 def get_summarizer():
     global _summarizer_tokenizer, _summarizer_model
     if _summarizer_tokenizer is None or _summarizer_model is None:
@@ -44,6 +54,7 @@ def get_summarizer():
         _summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, low_cpu_mem_usage=True)
         _summarizer_model.eval()
     return _summarizer_tokenizer, _summarizer_model
+
 
 def extract_from_txt(file_path):
     """Extract text from plain text file (.txt)."""
